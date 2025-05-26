@@ -1,0 +1,9 @@
+flask
+flask_socketio
+resemblyzer
+numpy
+sounddevice
+whisper
+torch
+transformers
+sklearn.cluster
