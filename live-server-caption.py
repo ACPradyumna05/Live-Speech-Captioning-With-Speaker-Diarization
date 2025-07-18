@@ -46,6 +46,34 @@ audio_queue = queue.Queue()
 is_recording = False
 audio_thread = None
 
+
+from sklearn.metrics import silhouette_score
+
+# Globals (if not already defined)
+last_kmeans_time = 0
+KMEANS_INTERVAL = 10
+speaker_labels = []
+speaker_centroids = {}
+speaker_counter = 0
+SLIDING_WINDOW_DURATION = 30  # seconds
+sliding_audio_buffer = np.zeros((SAMPLING_RATE * SLIDING_WINDOW_DURATION,), dtype=np.float32)
+
+def estimate_speakers(embeddings, max_speakers=5):
+    from sklearn.metrics import silhouette_score
+    best_k, best_score = 1, -1
+    for k in range(2, max_speakers + 1):
+        try:
+            km = KMeans(n_clusters=k).fit(embeddings)
+            score = silhouette_score(embeddings, km.labels_)
+            if score > best_score:
+                best_k = k
+                best_score = score
+        except:
+            continue
+    return best_k
+
+
+
 def initialize_models():
     """Initialize all available models"""
     global models, encoder
@@ -91,8 +119,8 @@ def transcribe_audio(audio_float, model_type):
     try:
         if model_type.startswith('whisper'):
             model = models[model_type]
-            result = model.transcribe(audio_float, language="en", fp16=False)
-            return result["text"].strip()
+            result = model.transcribe(audio_float, language="en", word_timestamps=True, fp16=False)
+            return result["text"].strip(), result.get("segments", [])
             
         elif model_type == 'wav2vec2':
             model_data = models[model_type]
@@ -104,7 +132,7 @@ def transcribe_audio(audio_float, model_type):
                 logits = model(input_values).logits
                 predicted_ids = torch.argmax(logits, dim=-1)
                 transcription = tokenizer.batch_decode(predicted_ids)[0]
-            return transcription.strip()
+            return transcription.strip(),[]
             
     except Exception as e:
         print(f"❌ Transcription error with {model_type}: {e}")
@@ -117,9 +145,10 @@ def audio_callback(indata, frames, time_info, status):
     if is_recording:
         audio_queue.put(indata.copy().flatten())
 
+
 def process_audio():
     """Process audio chunks and emit captions via WebSocket"""
-    global is_recording
+    global is_recording, sliding_audio_buffer, last_kmeans_time, speaker_centroids, speaker_counter
     
     stream = sd.InputStream(
         samplerate=SAMPLING_RATE,
@@ -128,77 +157,124 @@ def process_audio():
         blocksize=int(SAMPLING_RATE * CHUNK_DURATION),
     )
     
+
     try:
         with stream:
             print(f"🎤 Audio stream started with {MODEL_CONFIGS[current_model_type]['name']}")
             while is_recording:
                 try:
-                    # Get audio chunk with timeout to allow checking is_recording
                     audio_chunk = audio_queue.get(timeout=1.0)
-                    
-                    # Preprocess audio
                     audio_float = audio_chunk.astype(np.float32)
                     if np.max(np.abs(audio_float)) > 0:
-                        audio_float /= np.max(np.abs(audio_float))
+                        audio_float /= (np.max(np.abs(audio_float)) + 1e-6)
                     else:
-                        continue  # Skip silent chunks
-                    
-                    # Transcribe audio using current model
-                    text = transcribe_audio(audio_float, current_model_type)
-                    
-                    if not text:  # Skip empty transcriptions
                         continue
-                    
-                    # Voice embedding and speaker diarization
-                    wav = preprocess_wav(audio_float)
-                    _, embeddings, slices = encoder.embed_utterance(wav, return_partials=True, rate=16)
-                    
-                    if len(embeddings) == 0:
+
+                    # Update the sliding buffer
+                    buffer_len = len(sliding_audio_buffer)
+                    new_len = len(audio_float)
+                    sliding_audio_buffer = np.roll(sliding_audio_buffer, -new_len)
+                    sliding_audio_buffer[-new_len:] = audio_float
+
+                    text, segments = transcribe_audio(audio_float, current_model_type)
+                    if not text or not segments:
                         continue
-                    
-                    # Determine number of speakers (max 4, min 1)
-                    n_speakers = min(4, max(1, len(embeddings) // 3))
-                    if n_speakers > 1:
-                        kmeans = KMeans(n_clusters=n_speakers, random_state=0).fit(embeddings)
-                        labels = kmeans.labels_
-                    else:
-                        labels = [0] * len(embeddings)
-                    
-                    # Create speaker segments
-                    words = text.split()
-                    if len(words) == 0:
-                        continue
+
+                    # Refresh embeddings every few seconds using sliding buffer
+                    current_time = time.time()
+                    if current_time - last_kmeans_time > KMEANS_INTERVAL:
+                        wav = preprocess_wav(sliding_audio_buffer)
+                        _, embeddings, slices = encoder.embed_utterance(wav, return_partials=True, rate=16)
                         
-                    avg_words_per_segment = max(10, len(words) // len(labels))
-                    word_idx = 0
-                    segment_captions = []
-                    
-                    for i, label in enumerate(labels):
-                        speaker = f"Speaker {label + 1}"
-                        end_idx = min(word_idx + avg_words_per_segment, len(words))
-                        caption_words = words[word_idx:end_idx]
-                        word_idx = end_idx
-                        
-                        if caption_words:
-                            caption_text = f"[{speaker}]: {' '.join(caption_words)}"
-                            segment_captions.append(caption_text)
-                    
-                    # Emit captions via WebSocket
+                        if len(embeddings) == 0:
+                            continue
+
+                        n_speakers = estimate_speakers(embeddings)
+                        speaker_labels = KMeans(n_clusters=n_speakers).fit_predict(embeddings)
+                        speaker_embeddings = embeddings
+                        slice_segments = slices
+
+                        # Track consistent speakers
+                        new_centroids = [
+                            np.mean(speaker_embeddings[speaker_labels == i], axis=0)
+                            for i in range(n_speakers)
+                        ]
+
+                        speaker_id_map = {}
+                        for i, new_c in enumerate(new_centroids):
+                            best_match = None
+                            best_similarity = -1
+                            for old_id, old_c in speaker_centroids.items():
+                                sim = np.dot(new_c, old_c) / (np.linalg.norm(new_c) * np.linalg.norm(old_c))
+                                if sim > best_similarity:
+                                    best_similarity = sim
+                                    best_match = old_id
+                            if best_similarity > 0.75:
+                                speaker_id_map[i] = best_match
+                                speaker_centroids[best_match] = new_c
+                            else:
+                                speaker_counter += 1
+                                speaker_id_map[i] = speaker_counter
+                                speaker_centroids[speaker_counter] = new_c
+
+                        last_kmeans_time = current_time
+
+                    # Assign each word to speaker
+                    speaker_segments = {}  # maps speaker_id to word list
+
+                    for seg in segments:
+                        for word in seg.get("words", []):
+                            word_start, word_end = word["start"], word["end"]
+                            best_overlap, best_label = 0, 0
+
+                            for i, sl in enumerate(slice_segments):
+                                slice_start = sl.start / sampling_rate
+                                slice_end = sl.stop / sampling_rate
+                                overlap = max(0, min(word_end, slice_end) - max(word_start, slice_start))
+                                if overlap > best_overlap:
+                                    best_overlap = overlap
+                                    best_label = speaker_labels[i]
+
+                            speaker_id = speaker_id_map.get(best_label, 0)
+                            if speaker_id not in speaker_segments:
+                                speaker_segments[speaker_id] = []
+                            speaker_segments[speaker_id].append(word["word"])
+
+                    elapsed_time = round(time.time() - recording_start_time, 1)
+                    graph_data.append({
+                        "time": elapsed_time,
+                        "counts": {f"Speaker {sid}": len(words) for sid, words in speaker_segments.items()}
+                    })
+                    socketio.emit("graph_update", {
+                        "time": elapsed_time,
+                        "counts": graph_data[-1]["counts"]
+                    })
+
+                    # Emit speaker-wise caption blocks
                     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-                    
-                    for caption in segment_captions:
+                    for speaker_id, words in speaker_segments.items():
+                        caption_text = f"[Speaker {speaker_id}]: {' '.join(words)}"
                         socketio.emit('caption', {
                             'timestamp': timestamp,
-                            'text': caption,
+                            'text': caption_text,
                             'model': MODEL_CONFIGS[current_model_type]['name']
                         })
-                        print(f"🕒 {timestamp} - {caption}")
-                    
+                        print(f"🕒 {timestamp} - {caption_text}")
+
+                    # Emit graph data
+                    speaker_counts = {
+                        f"Speaker {sid}": len(words)
+                        for sid, words in speaker_segments.items()
+                    }
+                    socketio.emit("speaker_stats", speaker_counts)
+
+
                 except queue.Empty:
                     continue  # Timeout occurred, check if still recording
                 except Exception as e:
                     print(f"⚠️ Error processing audio: {e}")
                     continue
+
                     
     except Exception as e:
         print(f"⚠️ Audio stream error: {e}")
@@ -227,10 +303,18 @@ def handle_disconnect():
     """Handle client disconnection"""
     print('Client disconnected')
 
+graph_data = []
+recording_start_time = None
+
+
 @socketio.on('start_recording')
 def handle_start_recording():
     """Start audio recording and processing"""
     global is_recording, audio_thread
+    global graph_data, recording_start_time
+    graph_data = []
+    recording_start_time = time.time()
+
     
     if not current_model_type in models:
         emit('status', {'message': 'Model not loaded. Please select a model first.'})
